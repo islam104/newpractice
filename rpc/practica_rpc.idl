@@ -1,0 +1,8 @@
+[
+    uuid(2e5e9b2a-4f4b-4ab0-a77d-4bc23d640111),
+    version(1.0)
+]
+interface practica_rpc
+{
+    void RpcStopService([in] handle_t rpcBinding);
+}

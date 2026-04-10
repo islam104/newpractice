@@ -1,48 +1,47 @@
 # Practica
 
-Win32-приложение для Windows с иконкой в трее, одиночным запуском и сборкой через CMake.
+Windows-проект из двух приложений:
 
-## Возможности
+- `practica_service.exe` — Windows-служба;
+- `practica.exe` — GUI-клиент (трей-приложение).
 
-- добавляет иконку в системный трей при запуске;
-- показывает главное окно по левому клику по иконке;
-- показывает контекстное меню по правому клику;
-- поддерживает пункты `Открыть` и `Выход` в меню трея;
-- восстанавливает иконку после пересоздания панели задач;
-- поддерживает скрытый запуск через `--hidden`, `--minimized` или `/background`;
-- сворачивается в фон при закрытии окна;
-- имеет меню `Файл -> Выход` в главном окне;
-- не позволяет запускать более одного экземпляра приложения для одного пользователя.
+## Реализовано
 
-## Сборка локально
+- служба запускает GUI во всех пользовательских терминальных сессиях (кроме `Session 0`) в скрытом режиме;
+- служба реагирует на новые входы пользователей (`WTS_SESSION_LOGON`) и запускает GUI в новых сессиях;
+- служба не обрабатывает `Stop` и `Shutdown` от SCM;
+- служба поднимает Windows RPC сервер на транспорте `ALPC` (`ncalrpc`);
+- служба публикует RPC-интерфейс с методом остановки службы;
+- при остановке служба завершает все запущенные GUI-процессы;
+- GUI при старте проверяет состояние службы:
+  - если служба не запущена — запускает её, ждёт `Running`, затем завершает работу;
+  - если родительский процесс не служба — завершает работу;
+- пункты `Выход` в меню окна и в контекстном меню трея вызывают RPC-остановку службы.
+
+## Сборка
 
 ```powershell
 cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-Готовый артефакт:
+Артефакты:
 
 ```text
 build\Release\practica.exe
+build\Release\practica_service.exe
 ```
 
-Если `cmake` не в `PATH`, используйте проверенную команду в PowerShell:
+## Установка службы (пример)
 
 ```powershell
-cmd /c "call ""%ProgramFiles%\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"" >nul && ""%ProgramFiles%\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"" -S . -B cmake-check -G ""NMake Makefiles"" && ""%ProgramFiles%\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"" --build cmake-check"
+sc create PracticaService binPath= "C:\path\to\practica_service.exe" start= auto
+sc start PracticaService
 ```
 
-## Запуск в скрытом режиме
+Удаление:
 
 ```powershell
-.\build\Release\practica.exe --hidden
+sc stop PracticaService
+sc delete PracticaService
 ```
-
-## Visual Studio запуск
-
-- Откройте `practica.slnx`.
-- Выберите стартап-проект `practica` (это Win32 `vcxproj`).
-- Запустите `x64 | Debug` или `x64 | Release`.
-
-После переноса в `vcxproj` запуск из Visual Studio использует `..\src\main.cpp` с логикой трея.
