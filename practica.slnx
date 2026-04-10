@@ -1,0 +1,10 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="practica/practica.vcxproj" Id="4bd953ab-a389-4199-911b-e74b1efab3b4">
+    <Deploy />
+  </Project>
+</Solution>

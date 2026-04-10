@@ -1,0 +1,3 @@
+C:/Users/islam/source/repos/practica/build-ninja/CMakeFiles/CMakeScratch/TryCompile-s7jjsf/CMakeFiles/cmTC_f0de1.dir
+C:/Users/islam/source/repos/practica/build-ninja/CMakeFiles/CMakeScratch/TryCompile-s7jjsf/CMakeFiles/edit_cache.dir
+C:/Users/islam/source/repos/practica/build-ninja/CMakeFiles/CMakeScratch/TryCompile-s7jjsf/CMakeFiles/rebuild_cache.dir

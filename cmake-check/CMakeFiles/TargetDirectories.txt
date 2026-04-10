@@ -1,0 +1,6 @@
+C:/Users/islam/source/repos/practica/cmake-check/CMakeFiles/practica.dir
+C:/Users/islam/source/repos/practica/cmake-check/CMakeFiles/edit_cache.dir
+C:/Users/islam/source/repos/practica/cmake-check/CMakeFiles/rebuild_cache.dir
+C:/Users/islam/source/repos/practica/cmake-check/CMakeFiles/list_install_components.dir
+C:/Users/islam/source/repos/practica/cmake-check/CMakeFiles/install.dir
+C:/Users/islam/source/repos/practica/cmake-check/CMakeFiles/install/local.dir

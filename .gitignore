@@ -1,0 +1,24 @@
+.vs/
+*.user
+*.suo
+Debug/
+Release/
+x64/
+x86/
+
+# Local build/output directories
+build/
+build-*/
+cmake-*/
+quick-build/
+msbuild/
+
+# Common C/C++ build artifacts
+*.obj
+*.pdb
+*.ilk
+*.tlog
+*.log
+packages/
+
+packages/
