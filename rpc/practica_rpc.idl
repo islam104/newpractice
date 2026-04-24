@@ -4,5 +4,38 @@
 ]
 interface practica_rpc
 {
+    typedef struct _RPC_AUTH_USER_INFO
+    {
+        boolean authenticated;
+        [string] wchar_t* username;
+    } RPC_AUTH_USER_INFO;
+
+    typedef struct _RPC_LICENSE_INFO
+    {
+        boolean active;
+        [string] wchar_t* status;
+        [string] wchar_t* expiresAtUtc;
+    } RPC_LICENSE_INFO;
+
     void RpcStopService([in] handle_t rpcBinding);
+
+    error_status_t RpcGetCurrentUser(
+        [in] handle_t rpcBinding,
+        [out] RPC_AUTH_USER_INFO* userInfo);
+
+    error_status_t RpcLogin(
+        [in] handle_t rpcBinding,
+        [in, string] wchar_t* username,
+        [in, string] wchar_t* password);
+
+    error_status_t RpcLogout(
+        [in] handle_t rpcBinding);
+
+    error_status_t RpcGetActiveLicense(
+        [in] handle_t rpcBinding,
+        [out] RPC_LICENSE_INFO* licenseInfo);
+
+    error_status_t RpcActivateProduct(
+        [in] handle_t rpcBinding,
+        [in, string] wchar_t* activationCode);
 }
