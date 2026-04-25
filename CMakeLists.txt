@@ -43,6 +43,7 @@ add_executable(practica WIN32
 
 add_executable(practica_service WIN32
     src/service_main.cpp
+    src/service_backend.cpp
     src/session_launcher.cpp
 )
 
@@ -61,11 +62,11 @@ target_compile_definitions(practica_service PRIVATE
 )
 
 target_compile_options(practica PRIVATE
-    $<$<CXX_COMPILER_ID:MSVC>:/W4 /permissive->
+    $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /permissive->
 )
 
 target_compile_options(practica_service PRIVATE
-    $<$<CXX_COMPILER_ID:MSVC>:/W4 /permissive->
+    $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /permissive->
 )
 
 target_link_libraries(practica PRIVATE
@@ -82,6 +83,7 @@ target_link_libraries(practica_service PRIVATE
     rpcrt4
     wtsapi32
     userenv
+    winhttp
 )
 
 target_include_directories(practica PRIVATE
