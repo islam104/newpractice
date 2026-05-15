@@ -5,6 +5,8 @@
 #include <userenv.h>
 #include <wtsapi32.h>
 
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -23,7 +25,75 @@ CRITICAL_SECTION g_lock;
 std::vector<SessionProcess> g_processes;
 bool g_initialized = false;
 
-std::wstring BuildGuiCommandLine()
+void LogLauncherMessage(const std::wstring& message)
+{
+    wchar_t tempPath[MAX_PATH]{};
+    DWORD length = GetTempPathW(static_cast<DWORD>(std::size(tempPath)), tempPath);
+    if (length == 0 || length >= std::size(tempPath))
+    {
+        return;
+    }
+
+    std::wofstream logFile(std::wstring(tempPath) + L"practica_session_launcher.log", std::ios::app);
+    if (!logFile.is_open())
+    {
+        return;
+    }
+
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    logFile
+        << now.wYear << L"-"
+        << now.wMonth << L"-"
+        << now.wDay << L" "
+        << now.wHour << L":"
+        << now.wMinute << L":"
+        << now.wSecond << L" "
+        << message << std::endl;
+}
+
+std::wstring FormatLastError(const wchar_t* action, DWORD error)
+{
+    std::wstringstream stream;
+    stream << action << L" failed, error=" << error;
+    return stream.str();
+}
+
+bool EnablePrivilege(const wchar_t* privilegeName)
+{
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+    {
+        LogLauncherMessage(FormatLastError(L"OpenProcessToken", GetLastError()));
+        return false;
+    }
+
+    LUID luid{};
+    const bool lookedUp = LookupPrivilegeValueW(nullptr, privilegeName, &luid) == TRUE;
+    if (!lookedUp)
+    {
+        LogLauncherMessage(FormatLastError(L"LookupPrivilegeValueW", GetLastError()));
+        CloseHandle(token);
+        return false;
+    }
+
+    TOKEN_PRIVILEGES privileges{};
+    privileges.PrivilegeCount = 1;
+    privileges.Privileges[0].Luid = luid;
+    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    const bool adjusted = AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr) == TRUE &&
+        GetLastError() == ERROR_SUCCESS;
+
+    CloseHandle(token);
+    if (!adjusted)
+    {
+        LogLauncherMessage(FormatLastError(privilegeName, GetLastError()));
+    }
+    return adjusted;
+}
+
+std::wstring BuildGuiExePath()
 {
     wchar_t servicePath[MAX_PATH]{};
     GetModuleFileNameW(nullptr, servicePath, static_cast<DWORD>(std::size(servicePath)));
@@ -32,13 +102,54 @@ std::wstring BuildGuiCommandLine()
     const size_t separator = path.find_last_of(L"\\/");
     if (separator == std::wstring::npos)
     {
-        return std::wstring(kGuiExeName) + L" --hidden";
+        return kGuiExeName;
     }
 
     path = path.substr(0, separator + 1);
     path += kGuiExeName;
-    path += L" --hidden";
     return path;
+}
+
+std::wstring BuildGuiCommandLine(const std::wstring& guiExePath)
+{
+    return L"\"" + guiExePath + L"\" --hidden";
+}
+
+std::wstring BuildGuiWorkingDirectory(const std::wstring& guiExePath)
+{
+    const size_t separator = guiExePath.find_last_of(L"\\/");
+    if (separator == std::wstring::npos)
+    {
+        return L"";
+    }
+
+    return guiExePath.substr(0, separator);
+}
+
+bool HasUserInSession(const DWORD sessionId)
+{
+    LPWSTR userName = nullptr;
+    DWORD bytesReturned = 0;
+    const BOOL ok = WTSQuerySessionInformationW(
+        WTS_CURRENT_SERVER_HANDLE,
+        sessionId,
+        WTSUserName,
+        &userName,
+        &bytesReturned);
+
+    if (!ok)
+    {
+        LogLauncherMessage(FormatLastError(L"WTSQuerySessionInformationW", GetLastError()));
+        return false;
+    }
+
+    const bool hasUser = (userName != nullptr && userName[0] != L'\0');
+    if (userName)
+    {
+        WTSFreeMemory(userName);
+    }
+
+    return hasUser;
 }
 
 void StoreProcessHandle(const DWORD sessionId, HANDLE process)
@@ -110,6 +221,9 @@ void InitializeSessionLauncher()
 {
     if (!g_initialized)
     {
+        EnablePrivilege(SE_ASSIGNPRIMARYTOKEN_NAME);
+        EnablePrivilege(SE_INCREASE_QUOTA_NAME);
+        EnablePrivilege(SE_TCB_NAME);
         InitializeCriticalSection(&g_lock);
         g_initialized = true;
     }
@@ -131,6 +245,11 @@ void LaunchForSession(const DWORD sessionId)
         return;
     }
 
+    if (!HasUserInSession(sessionId))
+    {
+        return;
+    }
+
     RemoveDeadProcessHandles();
     if (IsSessionKnown(sessionId))
     {
@@ -140,6 +259,7 @@ void LaunchForSession(const DWORD sessionId)
     HANDLE userToken = nullptr;
     if (!WTSQueryUserToken(sessionId, &userToken))
     {
+        LogLauncherMessage(FormatLastError(L"WTSQueryUserToken", GetLastError()));
         return;
     }
 
@@ -152,12 +272,21 @@ void LaunchForSession(const DWORD sessionId)
             TokenPrimary,
             &primaryToken))
     {
+        LogLauncherMessage(FormatLastError(L"DuplicateTokenEx", GetLastError()));
         CloseHandle(userToken);
         return;
     }
 
+    if (!SetTokenInformation(primaryToken, TokenSessionId, const_cast<DWORD*>(&sessionId), sizeof(sessionId)))
+    {
+        LogLauncherMessage(FormatLastError(L"SetTokenInformation(TokenSessionId)", GetLastError()));
+    }
+
     LPVOID environment = nullptr;
-    CreateEnvironmentBlock(&environment, primaryToken, FALSE);
+    if (!CreateEnvironmentBlock(&environment, primaryToken, FALSE))
+    {
+        LogLauncherMessage(FormatLastError(L"CreateEnvironmentBlock", GetLastError()));
+    }
 
     STARTUPINFOW startupInfo{};
     startupInfo.cb = sizeof(startupInfo);
@@ -166,20 +295,35 @@ void LaunchForSession(const DWORD sessionId)
     startupInfo.wShowWindow = SW_HIDE;
 
     PROCESS_INFORMATION processInfo{};
-    std::wstring commandLine = BuildGuiCommandLine();
+    const std::wstring guiExePath = BuildGuiExePath();
+    std::wstring commandLine = BuildGuiCommandLine(guiExePath);
+    const std::wstring workingDirectory = BuildGuiWorkingDirectory(guiExePath);
 
     const bool created = CreateProcessAsUserW(
         primaryToken,
-        nullptr,
+        guiExePath.c_str(),
         commandLine.data(),
         nullptr,
         nullptr,
         FALSE,
         CREATE_UNICODE_ENVIRONMENT,
         environment,
-        nullptr,
+        workingDirectory.empty() ? nullptr : workingDirectory.c_str(),
         &startupInfo,
         &processInfo) == TRUE;
+
+    if (!created)
+    {
+        LogLauncherMessage(FormatLastError(L"CreateProcessAsUserW", GetLastError()));
+    }
+    else
+    {
+        std::wstringstream stream;
+        stream << L"CreateProcessAsUserW succeeded for session " << sessionId
+               << L", pid=" << processInfo.dwProcessId
+               << L", path=" << guiExePath;
+        LogLauncherMessage(stream.str());
+    }
 
     if (environment)
     {
