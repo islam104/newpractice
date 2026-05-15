@@ -1,18 +1,24 @@
 #include "service_backend.h"
 
+#include "av_engine.h"
 #include "shared_constants.h"
 
 #include <winhttp.h>
 
 #include <algorithm>
+#include <filesystem>
+#include <map>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #pragma comment(lib, "Winhttp.lib")
 
 namespace
 {
+constexpr wchar_t kFixedDrivesScheduleTarget[] = L"*fixed-drives*";
+
 struct AuthState
 {
     bool authenticated = false;
@@ -49,6 +55,12 @@ struct LicenseResponse
     std::wstring expiresAtUtc;
 };
 
+struct MonitoredFileState
+{
+    std::uint64_t fileSize = 0;
+    std::uint64_t lastWriteToken = 0;
+};
+
 CRITICAL_SECTION g_stateLock;
 bool g_lockInitialized = false;
 HANDLE g_schedulerEvent = nullptr;
@@ -58,8 +70,48 @@ volatile LONG g_backendRunning = 0;
 
 AuthState g_authState;
 LicenseState g_licenseState;
+AntivirusDatabase g_antivirusDatabase;
+BackendScheduleConfig g_scheduleConfig;
+BackendMonitorConfig g_monitorConfig;
+BackendScanResult g_lastBackgroundScanResult;
+std::map<std::wstring, MonitoredFileState> g_monitoredFiles;
+ULONGLONG g_lastMonitorPollTick = 0;
+ULONGLONG g_lastScheduledScanUtcSeconds = 0;
 
 constexpr DWORD kRequestTimeoutMs = 10000;
+
+std::wstring FormatUtcTimestamp(const ULONGLONG utcSeconds)
+{
+    if (utcSeconds == 0)
+    {
+        return {};
+    }
+
+    ULARGE_INTEGER value{};
+    value.QuadPart = (utcSeconds + 11644473600ULL) * 10000000ULL;
+
+    FILETIME fileTime{};
+    fileTime.dwLowDateTime = value.LowPart;
+    fileTime.dwHighDateTime = value.HighPart;
+
+    SYSTEMTIME systemTime{};
+    if (!FileTimeToSystemTime(&fileTime, &systemTime))
+    {
+        return {};
+    }
+
+    wchar_t buffer[32]{};
+    swprintf_s(
+        buffer,
+        L"%04u-%02u-%02uT%02u:%02u:%02uZ",
+        systemTime.wYear,
+        systemTime.wMonth,
+        systemTime.wDay,
+        systemTime.wHour,
+        systemTime.wMinute,
+        systemTime.wSecond);
+    return buffer;
+}
 
 std::wstring EscapeJsonString(const std::wstring& value)
 {
@@ -280,6 +332,21 @@ ULONGLONG CurrentUtcSeconds()
     return value.QuadPart / 10000000ULL - 11644473600ULL;
 }
 
+ULONGLONG CurrentTickMilliseconds()
+{
+    return GetTickCount64();
+}
+
+bool IsLicenseStateUsable(const LicenseState& licenseState)
+{
+    if (!licenseState.active || licenseState.expiresAtUtc.empty() || licenseState.expiryUtcSeconds == 0)
+    {
+        return false;
+    }
+
+    return licenseState.expiryUtcSeconds > CurrentUtcSeconds();
+}
+
 ULONGLONG ParseUtcIso8601Seconds(const std::wstring& value)
 {
     if (value.empty())
@@ -345,7 +412,6 @@ DWORD SendJsonRequest(
         return error;
     }
 
-    const DWORD flags = WINHTTP_FLAG_SECURE;
     HINTERNET request = WinHttpOpenRequest(
         connection,
         method,
@@ -353,7 +419,7 @@ DWORD SendJsonRequest(
         nullptr,
         WINHTTP_NO_REFERER,
         WINHTTP_DEFAULT_ACCEPT_TYPES,
-        flags);
+        WINHTTP_FLAG_SECURE);
     if (!request)
     {
         const DWORD error = GetLastError();
@@ -384,7 +450,6 @@ DWORD SendJsonRequest(
         static_cast<DWORD>(bodyUtf8.size()),
         static_cast<DWORD>(bodyUtf8.size()),
         0);
-
     if (!sendOk)
     {
         const DWORD error = GetLastError();
@@ -446,7 +511,6 @@ DWORD SendJsonRequest(
     }
 
     responseBody = Utf8ToWide(responseUtf8);
-
     WinHttpCloseHandle(request);
     WinHttpCloseHandle(connection);
     WinHttpCloseHandle(session);
@@ -515,9 +579,33 @@ void ApplyLicenseResponse(const LicenseResponse& response)
     g_licenseState.expiryUtcSeconds = ParseUtcIso8601Seconds(response.expiresAtUtc);
 }
 
+BackendScanResult ToBackendScanResult(const ScanResult& scanResult)
+{
+    BackendScanResult backendResult{};
+    backendResult.success = scanResult.success;
+    backendResult.malicious = scanResult.malicious;
+    backendResult.scannedObjects = scanResult.scannedObjects;
+    backendResult.infectedObjects = scanResult.infectedObjects;
+    backendResult.summary = scanResult.summary;
+    backendResult.details = scanResult.details;
+    return backendResult;
+}
+
+void ClearAntivirusStateLocked()
+{
+    g_antivirusDatabase.Clear();
+    g_scheduleConfig = {};
+    g_monitorConfig = {};
+    g_monitoredFiles.clear();
+    g_lastBackgroundScanResult = {};
+    g_lastMonitorPollTick = 0;
+    g_lastScheduledScanUtcSeconds = 0;
+}
+
 void ClearLicenseState()
 {
     g_licenseState = {};
+    ClearAntivirusStateLocked();
 }
 
 void ClearAuthState()
@@ -526,8 +614,97 @@ void ClearAuthState()
     ClearLicenseState();
 }
 
+DWORD EnsureDatabasesLoadedLocked()
+{
+    if (!IsLicenseStateUsable(g_licenseState))
+    {
+        return kRpcStatusLicenseMissing;
+    }
+
+    if (g_antivirusDatabase.IsLoaded())
+    {
+        return ERROR_SUCCESS;
+    }
+
+    if (!g_antivirusDatabase.LoadBuiltIn())
+    {
+        return kRpcStatusDatabasesUnavailable;
+    }
+
+    return ERROR_SUCCESS;
+}
+
+DWORD EnsureReadyForScanning()
+{
+    EnterCriticalSection(&g_stateLock);
+    if (!g_authState.authenticated)
+    {
+        LeaveCriticalSection(&g_stateLock);
+        return kRpcStatusNotAuthenticated;
+    }
+
+    const DWORD loadStatus = EnsureDatabasesLoadedLocked();
+    LeaveCriticalSection(&g_stateLock);
+    return loadStatus;
+}
+
+bool IsSupportedTargetPath(const std::wstring& path)
+{
+    return !path.empty();
+}
+
+BackendScanResult ExecuteConfiguredScanUnlocked(const BackendScheduleConfig& scheduleConfig)
+{
+    if (scheduleConfig.targetPath == kFixedDrivesScheduleTarget)
+    {
+        return ToBackendScanResult(g_antivirusDatabase.ScanFixedDrives());
+    }
+
+    const std::filesystem::path targetPath(scheduleConfig.targetPath);
+    if (!std::filesystem::exists(targetPath))
+    {
+        BackendScanResult result{};
+        result.success = false;
+        result.summary = L"Путь для фонового сканирования не найден.";
+        result.details = result.summary;
+        return result;
+    }
+
+    if (std::filesystem::is_regular_file(targetPath))
+    {
+        return ToBackendScanResult(g_antivirusDatabase.ScanFile(targetPath));
+    }
+
+    if (std::filesystem::is_directory(targetPath))
+    {
+        return ToBackendScanResult(g_antivirusDatabase.ScanDirectory(targetPath));
+    }
+
+    BackendScanResult result{};
+    result.success = false;
+    result.summary = L"Неподдерживаемый путь фонового сканирования.";
+    result.details = result.summary;
+    return result;
+}
+
 DWORD PerformLoginRequest(const std::wstring& username, const std::wstring& password, AuthResponse& response)
 {
+    if (kUseMockWebService)
+    {
+        if (username != kMockUsername || password != kMockPassword)
+        {
+            return kRpcStatusInvalidCredentials;
+        }
+
+        const ULONGLONG now = CurrentUtcSeconds();
+        response.username = username;
+        response.accessToken = L"mock-access-token";
+        response.refreshToken = L"mock-refresh-token";
+        response.accessExpiresAtUtc = FormatUtcTimestamp(now + 15 * 60);
+        response.refreshExpiresAtUtc = FormatUtcTimestamp(now + 24 * 60 * 60);
+        return ERROR_SUCCESS;
+    }
+
     DWORD httpStatus = 0;
     std::wstring responseBody;
     const std::wstring requestBody = BuildJsonBody({
@@ -557,6 +734,21 @@ DWORD PerformLoginRequest(const std::wstring& username, const std::wstring& pass
 
 DWORD PerformRefreshRequest(const std::wstring& refreshToken, AuthResponse& response)
 {
+    if (kUseMockWebService)
+    {
+        if (refreshToken != L"mock-refresh-token")
+        {
+            return kRpcStatusNotAuthenticated;
+        }
+
+        const ULONGLONG now = CurrentUtcSeconds();
+        response.accessToken = L"mock-access-token";
+        response.refreshToken = L"mock-refresh-token";
+        response.accessExpiresAtUtc = FormatUtcTimestamp(now + 15 * 60);
+        response.refreshExpiresAtUtc = FormatUtcTimestamp(now + 24 * 60 * 60);
+        return ERROR_SUCCESS;
+    }
+
     DWORD httpStatus = 0;
     std::wstring responseBody;
     const std::wstring requestBody = BuildJsonBody({{L"refreshToken", refreshToken}});
@@ -572,6 +764,11 @@ DWORD PerformRefreshRequest(const std::wstring& refreshToken, AuthResponse& resp
 
 DWORD PerformLogoutRequest(const std::wstring& accessToken)
 {
+    if (kUseMockWebService)
+    {
+        return accessToken.empty() ? kRpcStatusNotAuthenticated : ERROR_SUCCESS;
+    }
+
     DWORD httpStatus = 0;
     std::wstring responseBody;
     const DWORD requestStatus = SendJsonRequest(L"POST", kApiLogoutPath, L"{}", accessToken, httpStatus, responseBody);
@@ -590,6 +787,31 @@ DWORD PerformLogoutRequest(const std::wstring& accessToken)
 
 DWORD PerformLicenseStatusRequest(const std::wstring& accessToken, LicenseResponse& response)
 {
+    if (kUseMockWebService)
+    {
+        if (accessToken.empty())
+        {
+            return kRpcStatusNotAuthenticated;
+        }
+
+        EnterCriticalSection(&g_stateLock);
+        const bool hasLicense = IsLicenseStateUsable(g_licenseState);
+        if (hasLicense)
+        {
+            response.active = g_licenseState.active;
+            response.status = g_licenseState.status;
+            response.ticket = g_licenseState.ticket;
+            response.expiresAtUtc = g_licenseState.expiresAtUtc;
+        }
+        else if (g_licenseState.active && g_licenseState.expiryUtcSeconds != 0 && g_licenseState.expiryUtcSeconds <= CurrentUtcSeconds())
+        {
+            ClearLicenseState();
+        }
+        LeaveCriticalSection(&g_stateLock);
+
+        return hasLicense ? ERROR_SUCCESS : kRpcStatusLicenseMissing;
+    }
+
     DWORD httpStatus = 0;
     std::wstring responseBody;
     const DWORD requestStatus = SendJsonRequest(L"GET", kApiLicensePath, L"", accessToken, httpStatus, responseBody);
@@ -618,6 +840,27 @@ DWORD PerformLicenseStatusRequest(const std::wstring& accessToken, LicenseRespon
 
 DWORD PerformActivateRequest(const std::wstring& accessToken, const std::wstring& activationCode, LicenseResponse& response, bool& licenseReturned)
 {
+    if (kUseMockWebService)
+    {
+        if (accessToken.empty())
+        {
+            return kRpcStatusNotAuthenticated;
+        }
+
+        if (activationCode != kMockActivationCode)
+        {
+            return kRpcStatusActivationFailed;
+        }
+
+        const ULONGLONG now = CurrentUtcSeconds();
+        response.active = true;
+        response.status = L"active";
+        response.ticket = L"mock-license-ticket";
+        response.expiresAtUtc = FormatUtcTimestamp(now + 60ULL * 60ULL * 24ULL);
+        licenseReturned = true;
+        return ERROR_SUCCESS;
+    }
+
     DWORD httpStatus = 0;
     std::wstring responseBody;
     const std::wstring requestBody = BuildJsonBody({{L"code", activationCode}});
@@ -667,6 +910,7 @@ DWORD RefreshTokensLockedCopy(std::wstring& refreshToken)
     {
         return kRpcStatusNotAuthenticated;
     }
+
     return ERROR_SUCCESS;
 }
 
@@ -719,8 +963,12 @@ DWORD RefreshLicenseIfNeeded()
 {
     std::wstring accessToken;
     EnterCriticalSection(&g_stateLock);
-    if (!g_authState.authenticated || !g_licenseState.active)
+    if (!g_authState.authenticated || !IsLicenseStateUsable(g_licenseState))
     {
+        if (g_licenseState.active && !IsLicenseStateUsable(g_licenseState))
+        {
+            ClearLicenseState();
+        }
         LeaveCriticalSection(&g_stateLock);
         return ERROR_SUCCESS;
     }
@@ -742,6 +990,7 @@ DWORD RefreshLicenseIfNeeded()
     if (status == ERROR_SUCCESS)
     {
         ApplyLicenseResponse(response);
+        EnsureDatabasesLoadedLocked();
     }
     else if (status == kRpcStatusLicenseMissing)
     {
@@ -759,37 +1008,219 @@ DWORD RefreshLicenseIfNeeded()
 DWORD ComputeNextWaitMilliseconds()
 {
     EnterCriticalSection(&g_stateLock);
-    const ULONGLONG now = CurrentUtcSeconds();
-    ULONGLONG nextDue = 0;
+    const ULONGLONG nowUtc = CurrentUtcSeconds();
+    const ULONGLONG nowTick = CurrentTickMilliseconds();
+    ULONGLONG nextDueUtc = 0;
+    ULONGLONG nextDueTick = 0;
 
     if (g_authState.authenticated && g_authState.accessExpiryUtcSeconds != 0)
     {
-        nextDue = (g_authState.accessExpiryUtcSeconds > kTokenRefreshSkewSeconds)
+        nextDueUtc = (g_authState.accessExpiryUtcSeconds > kTokenRefreshSkewSeconds)
             ? (g_authState.accessExpiryUtcSeconds - kTokenRefreshSkewSeconds)
-            : now;
+            : nowUtc;
     }
 
     if (g_licenseState.active && g_licenseState.expiryUtcSeconds != 0)
     {
         const ULONGLONG licenseDue = (g_licenseState.expiryUtcSeconds > kLicenseRefreshSkewSeconds)
             ? (g_licenseState.expiryUtcSeconds - kLicenseRefreshSkewSeconds)
-            : now;
-        if (nextDue == 0 || licenseDue < nextDue)
+            : nowUtc;
+        if (nextDueUtc == 0 || licenseDue < nextDueUtc)
         {
-            nextDue = licenseDue;
+            nextDueUtc = licenseDue;
+        }
+    }
+
+    if (!g_monitorConfig.directories.empty())
+    {
+        nextDueTick = (g_lastMonitorPollTick == 0) ? nowTick : (g_lastMonitorPollTick + kMonitorPollIntervalMs);
+    }
+
+    if (g_scheduleConfig.enabled && g_scheduleConfig.intervalMinutes != 0)
+    {
+        const ULONGLONG dueTick = (g_lastScheduledScanUtcSeconds == 0)
+            ? nowTick
+            : nowTick + ((g_lastScheduledScanUtcSeconds + static_cast<ULONGLONG>(g_scheduleConfig.intervalMinutes) * 60ULL > nowUtc)
+                ? ((g_lastScheduledScanUtcSeconds + static_cast<ULONGLONG>(g_scheduleConfig.intervalMinutes) * 60ULL - nowUtc) * 1000ULL)
+                : 0ULL);
+        if (nextDueTick == 0 || dueTick < nextDueTick)
+        {
+            nextDueTick = dueTick;
         }
     }
 
     LeaveCriticalSection(&g_stateLock);
 
-    if (nextDue == 0 || nextDue <= now)
+    ULONGLONG bestDelayMs = std::numeric_limits<ULONGLONG>::max();
+    if (nextDueUtc != 0)
     {
-        return (nextDue == 0) ? INFINITE : 1000;
+        const ULONGLONG delayMs = (nextDueUtc <= nowUtc) ? 1000ULL : ((nextDueUtc - nowUtc) * 1000ULL);
+        bestDelayMs = std::min(bestDelayMs, delayMs);
     }
 
-    const ULONGLONG deltaSeconds = nextDue - now;
-    const ULONGLONG deltaMs = deltaSeconds * 1000ULL;
-    return (deltaMs > MAXDWORD) ? MAXDWORD : static_cast<DWORD>(deltaMs);
+    if (nextDueTick != 0)
+    {
+        const ULONGLONG delayMs = (nextDueTick <= nowTick) ? 1000ULL : (nextDueTick - nowTick);
+        bestDelayMs = std::min(bestDelayMs, delayMs);
+    }
+
+    if (bestDelayMs == std::numeric_limits<ULONGLONG>::max())
+    {
+        return INFINITE;
+    }
+
+    return (bestDelayMs > MAXDWORD) ? MAXDWORD : static_cast<DWORD>(bestDelayMs);
+}
+
+void UpdateBackgroundResultLocked(BackendScanResult result)
+{
+    if (!result.summary.empty())
+    {
+        std::wstringstream stream;
+        stream << result.summary << L"\r\nПоследнее обновление: " << FormatUtcTimestamp(CurrentUtcSeconds());
+        result.summary = stream.str();
+    }
+
+    g_lastBackgroundScanResult = std::move(result);
+}
+
+void RunScheduledScanIfDue()
+{
+    BackendScheduleConfig scheduleConfig;
+    EnterCriticalSection(&g_stateLock);
+    if (!g_scheduleConfig.enabled || g_scheduleConfig.intervalMinutes == 0)
+    {
+        LeaveCriticalSection(&g_stateLock);
+        return;
+    }
+
+    const ULONGLONG nowUtc = CurrentUtcSeconds();
+    if (g_lastScheduledScanUtcSeconds != 0 &&
+        nowUtc < g_lastScheduledScanUtcSeconds + static_cast<ULONGLONG>(g_scheduleConfig.intervalMinutes) * 60ULL)
+    {
+        LeaveCriticalSection(&g_stateLock);
+        return;
+    }
+
+    if (EnsureDatabasesLoadedLocked() != ERROR_SUCCESS)
+    {
+        LeaveCriticalSection(&g_stateLock);
+        return;
+    }
+
+    scheduleConfig = g_scheduleConfig;
+    LeaveCriticalSection(&g_stateLock);
+
+    BackendScanResult result = ExecuteConfiguredScanUnlocked(scheduleConfig);
+
+    EnterCriticalSection(&g_stateLock);
+    g_lastScheduledScanUtcSeconds = CurrentUtcSeconds();
+    UpdateBackgroundResultLocked(std::move(result));
+    LeaveCriticalSection(&g_stateLock);
+}
+
+bool QueryFileState(const std::filesystem::path& filePath, MonitoredFileState& state)
+{
+    std::error_code errorCode;
+    if (!std::filesystem::is_regular_file(filePath, errorCode))
+    {
+        return false;
+    }
+
+    state.fileSize = std::filesystem::file_size(filePath, errorCode);
+    if (errorCode)
+    {
+        return false;
+    }
+
+    const auto lastWrite = std::filesystem::last_write_time(filePath, errorCode);
+    if (errorCode)
+    {
+        return false;
+    }
+
+    state.lastWriteToken = static_cast<std::uint64_t>(lastWrite.time_since_epoch().count());
+    return true;
+}
+
+void PollMonitoredDirectories()
+{
+    std::vector<std::wstring> directories;
+    std::map<std::wstring, MonitoredFileState> previousSnapshot;
+
+    EnterCriticalSection(&g_stateLock);
+    if (g_monitorConfig.directories.empty())
+    {
+        LeaveCriticalSection(&g_stateLock);
+        return;
+    }
+
+    const ULONGLONG nowTick = CurrentTickMilliseconds();
+    if (g_lastMonitorPollTick != 0 && nowTick < g_lastMonitorPollTick + kMonitorPollIntervalMs)
+    {
+        LeaveCriticalSection(&g_stateLock);
+        return;
+    }
+
+    if (EnsureDatabasesLoadedLocked() != ERROR_SUCCESS)
+    {
+        LeaveCriticalSection(&g_stateLock);
+        return;
+    }
+
+    directories = g_monitorConfig.directories;
+    previousSnapshot = g_monitoredFiles;
+    g_lastMonitorPollTick = nowTick;
+    LeaveCriticalSection(&g_stateLock);
+
+    std::map<std::wstring, MonitoredFileState> newSnapshot;
+    BackendScanResult latestResult{};
+    bool hasBackgroundResult = false;
+
+    for (const std::wstring& directory : directories)
+    {
+        std::error_code errorCode;
+        if (!std::filesystem::exists(directory, errorCode) || !std::filesystem::is_directory(directory, errorCode))
+        {
+            continue;
+        }
+
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(directory, std::filesystem::directory_options::skip_permission_denied))
+        {
+            MonitoredFileState currentState{};
+            if (!QueryFileState(entry.path(), currentState))
+            {
+                continue;
+            }
+
+            const std::wstring pathKey = entry.path().wstring();
+            newSnapshot[pathKey] = currentState;
+
+            const auto previousIt = previousSnapshot.find(pathKey);
+            const bool changed =
+                previousIt == previousSnapshot.end() ||
+                previousIt->second.fileSize != currentState.fileSize ||
+                previousIt->second.lastWriteToken != currentState.lastWriteToken;
+            if (!changed)
+            {
+                continue;
+            }
+
+            latestResult = ToBackendScanResult(g_antivirusDatabase.ScanFile(entry.path()));
+            if (latestResult.success)
+            {
+                hasBackgroundResult = true;
+            }
+        }
+    }
+
+    EnterCriticalSection(&g_stateLock);
+    g_monitoredFiles = std::move(newSnapshot);
+    if (hasBackgroundResult)
+    {
+        UpdateBackgroundResultLocked(std::move(latestResult));
+    }
+    LeaveCriticalSection(&g_stateLock);
 }
 
 DWORD WINAPI BackendWorkerThread(LPVOID)
@@ -808,14 +1239,12 @@ DWORD WINAPI BackendWorkerThread(LPVOID)
         if (waitResult == WAIT_OBJECT_0 + 1)
         {
             ResetEvent(g_schedulerEvent);
-            continue;
         }
 
-        if (waitResult == WAIT_TIMEOUT)
-        {
-            RefreshTokensIfNeeded();
-            RefreshLicenseIfNeeded();
-        }
+        RefreshTokensIfNeeded();
+        RefreshLicenseIfNeeded();
+        RunScheduledScanIfDue();
+        PollMonitoredDirectories();
     }
 
     return 0;
@@ -943,13 +1372,18 @@ DWORD GetCurrentLicense(BackendLicenseInfo& licenseInfo)
         return kRpcStatusNotAuthenticated;
     }
 
-    if (g_licenseState.active)
+    if (IsLicenseStateUsable(g_licenseState))
     {
         licenseInfo.active = g_licenseState.active;
         licenseInfo.status = g_licenseState.status;
         licenseInfo.expiresAtUtc = g_licenseState.expiresAtUtc;
         LeaveCriticalSection(&g_stateLock);
         return ERROR_SUCCESS;
+    }
+
+    if (g_licenseState.active && !IsLicenseStateUsable(g_licenseState))
+    {
+        ClearLicenseState();
     }
 
     accessToken = g_authState.accessToken;
@@ -974,6 +1408,7 @@ DWORD GetCurrentLicense(BackendLicenseInfo& licenseInfo)
 
     EnterCriticalSection(&g_stateLock);
     ApplyLicenseResponse(response);
+    EnsureDatabasesLoadedLocked();
     licenseInfo.active = g_licenseState.active;
     licenseInfo.status = g_licenseState.status;
     licenseInfo.expiresAtUtc = g_licenseState.expiresAtUtc;
@@ -1022,8 +1457,132 @@ DWORD ActivateLicense(const std::wstring& activationCode)
 
     EnterCriticalSection(&g_stateLock);
     ApplyLicenseResponse(finalLicense);
+    status = EnsureDatabasesLoadedLocked();
+    LeaveCriticalSection(&g_stateLock);
+    if (status != ERROR_SUCCESS)
+    {
+        return status;
+    }
+
+    SignalScheduler();
+    return ERROR_SUCCESS;
+}
+
+DWORD GetDatabaseInfo(BackendDatabaseInfo& databaseInfo)
+{
+    EnterCriticalSection(&g_stateLock);
+    const DWORD status = EnsureDatabasesLoadedLocked();
+    if (status != ERROR_SUCCESS)
+    {
+        databaseInfo = {};
+        LeaveCriticalSection(&g_stateLock);
+        return status;
+    }
+
+    const AvDatabaseInfo info = g_antivirusDatabase.GetInfo();
+    databaseInfo.loaded = info.loaded;
+    databaseInfo.releaseDateUtc = info.releaseDateUtc;
+    databaseInfo.recordCount = info.recordCount;
+    LeaveCriticalSection(&g_stateLock);
+    return ERROR_SUCCESS;
+}
+
+DWORD ScanSelectedFile(const std::wstring& filePath, BackendScanResult& scanResult)
+{
+    if (filePath.empty())
+    {
+        return kRpcStatusInvalidPath;
+    }
+
+    const DWORD readyStatus = EnsureReadyForScanning();
+    if (readyStatus != ERROR_SUCCESS)
+    {
+        return readyStatus;
+    }
+
+    scanResult = ToBackendScanResult(g_antivirusDatabase.ScanFile(filePath));
+    return scanResult.success ? ERROR_SUCCESS : kRpcStatusInvalidPath;
+}
+
+DWORD ScanSelectedDirectory(const std::wstring& directoryPath, BackendScanResult& scanResult)
+{
+    if (directoryPath.empty())
+    {
+        return kRpcStatusInvalidPath;
+    }
+
+    const DWORD readyStatus = EnsureReadyForScanning();
+    if (readyStatus != ERROR_SUCCESS)
+    {
+        return readyStatus;
+    }
+
+    scanResult = ToBackendScanResult(g_antivirusDatabase.ScanDirectory(directoryPath));
+    return scanResult.success ? ERROR_SUCCESS : kRpcStatusInvalidPath;
+}
+
+DWORD ScanAllFixedDrives(BackendScanResult& scanResult)
+{
+    const DWORD readyStatus = EnsureReadyForScanning();
+    if (readyStatus != ERROR_SUCCESS)
+    {
+        return readyStatus;
+    }
+
+    scanResult = ToBackendScanResult(g_antivirusDatabase.ScanFixedDrives());
+    return scanResult.success ? ERROR_SUCCESS : kRpcStatusInvalidPath;
+}
+
+DWORD ConfigureScheduledScan(const BackendScheduleConfig& scheduleConfig)
+{
+    EnterCriticalSection(&g_stateLock);
+    const DWORD status = EnsureDatabasesLoadedLocked();
+    if (status != ERROR_SUCCESS)
+    {
+        LeaveCriticalSection(&g_stateLock);
+        return status;
+    }
+
+    if (scheduleConfig.enabled)
+    {
+        if (!IsSupportedTargetPath(scheduleConfig.targetPath) || scheduleConfig.intervalMinutes == 0)
+        {
+            LeaveCriticalSection(&g_stateLock);
+            return kRpcStatusInvalidPath;
+        }
+    }
+
+    g_scheduleConfig = scheduleConfig;
+    g_lastScheduledScanUtcSeconds = 0;
     LeaveCriticalSection(&g_stateLock);
 
     SignalScheduler();
+    return ERROR_SUCCESS;
+}
+
+DWORD ConfigureMonitoredDirectories(const BackendMonitorConfig& monitorConfig)
+{
+    EnterCriticalSection(&g_stateLock);
+    const DWORD status = EnsureDatabasesLoadedLocked();
+    if (status != ERROR_SUCCESS)
+    {
+        LeaveCriticalSection(&g_stateLock);
+        return status;
+    }
+
+    g_monitorConfig = monitorConfig;
+    g_monitoredFiles.clear();
+    g_lastMonitorPollTick = 0;
+    LeaveCriticalSection(&g_stateLock);
+
+    SignalScheduler();
+    return ERROR_SUCCESS;
+}
+
+DWORD GetLastBackgroundScanResult(BackendScanResult& scanResult)
+{
+    EnterCriticalSection(&g_stateLock);
+    scanResult = g_lastBackgroundScanResult;
+    LeaveCriticalSection(&g_stateLock);
     return ERROR_SUCCESS;
 }

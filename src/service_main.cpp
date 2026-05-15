@@ -8,7 +8,9 @@
 #include <wtsapi32.h>
 
 #include <cstring>
+#include <sstream>
 #include <string>
+#include <vector>
 
 #pragma comment(lib, "Rpcrt4.lib")
 
@@ -149,6 +151,32 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
 
     SetServiceState(SERVICE_STOPPED, 0, rpcStatus);
 }
+
+std::vector<std::wstring> SplitDirectories(const std::wstring& value)
+{
+    std::vector<std::wstring> directories;
+    std::wstringstream stream(value);
+    std::wstring current;
+    while (std::getline(stream, current, L';'))
+    {
+        if (!current.empty())
+        {
+            directories.push_back(current);
+        }
+    }
+
+    return directories;
+}
+
+void FillScanResult(const BackendScanResult& backendResult, RPC_SCAN_RESULT& rpcResult)
+{
+    rpcResult.success = backendResult.success ? 1 : 0;
+    rpcResult.malicious = backendResult.malicious ? 1 : 0;
+    rpcResult.scannedObjects = backendResult.scannedObjects;
+    rpcResult.infectedObjects = backendResult.infectedObjects;
+    rpcResult.summary = AllocateRpcString(backendResult.summary);
+    rpcResult.details = AllocateRpcString(backendResult.details);
+}
 } // namespace
 
 extern "C" void RpcStopService(handle_t)
@@ -221,6 +249,114 @@ extern "C" error_status_t RpcGetActiveLicense(handle_t, RPC_LICENSE_INFO* licens
 extern "C" error_status_t RpcActivateProduct(handle_t, wchar_t* activationCode)
 {
     return ActivateLicense(activationCode ? activationCode : L"");
+}
+
+extern "C" error_status_t RpcGetDatabaseInfo(handle_t, RPC_DATABASE_INFO* databaseInfo)
+{
+    if (!databaseInfo)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    BackendDatabaseInfo backendInfo{};
+    const DWORD status = GetDatabaseInfo(backendInfo);
+    if (status != ERROR_SUCCESS)
+    {
+        return status;
+    }
+
+    databaseInfo->loaded = backendInfo.loaded ? 1 : 0;
+    databaseInfo->recordCount = backendInfo.recordCount;
+    databaseInfo->releaseDateUtc = AllocateRpcString(backendInfo.releaseDateUtc);
+    return ERROR_SUCCESS;
+}
+
+extern "C" error_status_t RpcScanFile(handle_t, wchar_t* filePath, RPC_SCAN_RESULT* scanResult)
+{
+    if (!scanResult)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    BackendScanResult backendResult{};
+    const DWORD status = ScanSelectedFile(filePath ? filePath : L"", backendResult);
+    if (status != ERROR_SUCCESS)
+    {
+        return status;
+    }
+
+    FillScanResult(backendResult, *scanResult);
+    return ERROR_SUCCESS;
+}
+
+extern "C" error_status_t RpcScanDirectory(handle_t, wchar_t* directoryPath, RPC_SCAN_RESULT* scanResult)
+{
+    if (!scanResult)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    BackendScanResult backendResult{};
+    const DWORD status = ScanSelectedDirectory(directoryPath ? directoryPath : L"", backendResult);
+    if (status != ERROR_SUCCESS)
+    {
+        return status;
+    }
+
+    FillScanResult(backendResult, *scanResult);
+    return ERROR_SUCCESS;
+}
+
+extern "C" error_status_t RpcScanFixedDrives(handle_t, RPC_SCAN_RESULT* scanResult)
+{
+    if (!scanResult)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    BackendScanResult backendResult{};
+    const DWORD status = ScanAllFixedDrives(backendResult);
+    if (status != ERROR_SUCCESS)
+    {
+        return status;
+    }
+
+    FillScanResult(backendResult, *scanResult);
+    return ERROR_SUCCESS;
+}
+
+extern "C" error_status_t RpcConfigureScheduledScan(handle_t, RPC_SCHEDULE_CONFIG scheduleConfig)
+{
+    BackendScheduleConfig backendConfig{};
+    backendConfig.enabled = scheduleConfig.enabled != 0;
+    backendConfig.intervalMinutes = scheduleConfig.intervalMinutes;
+    backendConfig.targetPath = scheduleConfig.targetPath ? scheduleConfig.targetPath : L"";
+    return ConfigureScheduledScan(backendConfig);
+}
+
+extern "C" error_status_t RpcConfigureMonitoredDirectories(handle_t, wchar_t* directories)
+{
+    BackendMonitorConfig backendConfig{};
+    backendConfig.directories = SplitDirectories(directories ? directories : L"");
+    return ConfigureMonitoredDirectories(backendConfig);
+}
+
+extern "C" error_status_t RpcGetLastBackgroundScanResult(handle_t, RPC_SCAN_RESULT* scanResult)
+{
+    if (!scanResult)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    BackendScanResult backendResult{};
+    const DWORD status = GetLastBackgroundScanResult(backendResult);
+    if (status != ERROR_SUCCESS)
+    {
+        return status;
+    }
+
+    FillScanResult(backendResult, *scanResult);
+    return ERROR_SUCCESS;
 }
 
 extern "C" void* __RPC_USER midl_user_allocate(const size_t size);

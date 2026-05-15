@@ -22,7 +22,15 @@ inline constexpr DWORD kRpcStatusInvalidCredentials = 0x20000003;
 inline constexpr DWORD kRpcStatusActivationFailed = 0x20000004;
 inline constexpr DWORD kRpcStatusBackendUnavailable = 0x20000005;
 inline constexpr DWORD kRpcStatusWebServiceError = 0x20000006;
+inline constexpr DWORD kRpcStatusDatabasesUnavailable = 0x20000007;
+inline constexpr DWORD kRpcStatusInvalidPath = 0x20000008;
 
 inline constexpr DWORD kTokenRefreshSkewSeconds = 60;
 inline constexpr DWORD kLicenseRefreshSkewSeconds = 300;
 inline constexpr DWORD kGuiPollIntervalMs = 5000;
+inline constexpr DWORD kMonitorPollIntervalMs = 5000;
+
+inline constexpr bool kUseMockWebService = false;
+inline constexpr wchar_t kMockUsername[] = L"demo";
+inline constexpr wchar_t kMockPassword[] = L"demo";
+inline constexpr wchar_t kMockActivationCode[] = L"AAAA-BBBB-CCCC";

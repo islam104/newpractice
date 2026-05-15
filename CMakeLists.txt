@@ -42,6 +42,7 @@ add_executable(practica WIN32
 )
 
 add_executable(practica_service WIN32
+    src/av_engine.cpp
     src/service_main.cpp
     src/service_backend.cpp
     src/session_launcher.cpp
@@ -80,6 +81,7 @@ target_link_libraries(practica PRIVATE
 target_link_libraries(practica_service PRIVATE
     practica_rpc
     advapi32
+    bcrypt
     rpcrt4
     wtsapi32
     userenv

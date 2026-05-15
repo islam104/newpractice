@@ -17,6 +17,30 @@ interface practica_rpc
         [string] wchar_t* expiresAtUtc;
     } RPC_LICENSE_INFO;
 
+    typedef struct _RPC_DATABASE_INFO
+    {
+        boolean loaded;
+        unsigned long recordCount;
+        [string] wchar_t* releaseDateUtc;
+    } RPC_DATABASE_INFO;
+
+    typedef struct _RPC_SCAN_RESULT
+    {
+        boolean success;
+        boolean malicious;
+        hyper scannedObjects;
+        hyper infectedObjects;
+        [string] wchar_t* summary;
+        [string] wchar_t* details;
+    } RPC_SCAN_RESULT;
+
+    typedef struct _RPC_SCHEDULE_CONFIG
+    {
+        boolean enabled;
+        unsigned long intervalMinutes;
+        [string] wchar_t* targetPath;
+    } RPC_SCHEDULE_CONFIG;
+
     void RpcStopService([in] handle_t rpcBinding);
 
     error_status_t RpcGetCurrentUser(
@@ -38,4 +62,34 @@ interface practica_rpc
     error_status_t RpcActivateProduct(
         [in] handle_t rpcBinding,
         [in, string] wchar_t* activationCode);
+
+    error_status_t RpcGetDatabaseInfo(
+        [in] handle_t rpcBinding,
+        [out] RPC_DATABASE_INFO* databaseInfo);
+
+    error_status_t RpcScanFile(
+        [in] handle_t rpcBinding,
+        [in, string] wchar_t* filePath,
+        [out] RPC_SCAN_RESULT* scanResult);
+
+    error_status_t RpcScanDirectory(
+        [in] handle_t rpcBinding,
+        [in, string] wchar_t* directoryPath,
+        [out] RPC_SCAN_RESULT* scanResult);
+
+    error_status_t RpcScanFixedDrives(
+        [in] handle_t rpcBinding,
+        [out] RPC_SCAN_RESULT* scanResult);
+
+    error_status_t RpcConfigureScheduledScan(
+        [in] handle_t rpcBinding,
+        [in] RPC_SCHEDULE_CONFIG scheduleConfig);
+
+    error_status_t RpcConfigureMonitoredDirectories(
+        [in] handle_t rpcBinding,
+        [in, string] wchar_t* directories);
+
+    error_status_t RpcGetLastBackgroundScanResult(
+        [in] handle_t rpcBinding,
+        [out] RPC_SCAN_RESULT* scanResult);
 }
